@@ -1,0 +1,14 @@
+# Optional GPU acceleration via ROCm (AMD) or CUDA (NVIDIA).
+# Install INSTEAD of the CPU torch that comes with easyocr.
+#
+# === AMD GPU (ROCm) — CachyOS / Arch Linux ===
+# pip install -r requirements-gpu.txt --index-url https://download.pytorch.org/whl/rocm6.1
+#
+# === AMD GPU (ROCm) — Windows (limited support, RX 6000+ series) ===
+# pip install -r requirements-gpu.txt --index-url https://download.pytorch.org/whl/rocm6.0
+#
+# === NVIDIA GPU (CUDA 12.x) ===
+# pip install -r requirements-gpu.txt --index-url https://download.pytorch.org/whl/cu121
+
+torch>=2.1.0
+easyocr>=1.7.0

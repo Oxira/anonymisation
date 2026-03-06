@@ -45,6 +45,38 @@ if not exist "%FLAG%" (
     echo ok > "%FLAG%"
 )
 
+:: --- Verifier et corriger Tesseract + fra.traineddata ---
+set "TESS_DIR="
+if exist "C:\Program Files\Tesseract-OCR\tesseract.exe" set "TESS_DIR=C:\Program Files\Tesseract-OCR"
+if exist "C:\Program Files (x86)\Tesseract-OCR\tesseract.exe" set "TESS_DIR=C:\Program Files (x86)\Tesseract-OCR"
+
+if "%TESS_DIR%"=="" (
+    echo ERREUR : Tesseract introuvable.
+    echo Telechargez-le depuis : https://github.com/UB-Mannheim/tesseract/wiki
+    pause
+    exit /b 1
+)
+
+set "TESSDATA=%TESS_DIR%\tessdata"
+set "FRA_FILE=%TESSDATA%\fra.traineddata"
+
+if not exist "%FRA_FILE%" (
+    echo Telechargement des donnees de langue francaise pour Tesseract...
+    powershell -Command "Invoke-WebRequest -Uri 'https://github.com/tesseract-ocr/tessdata/raw/main/fra.traineddata' -OutFile '%FRA_FILE%'"
+    if errorlevel 1 (
+        echo ERREUR : Impossible de telecharger fra.traineddata
+        echo Telechargez manuellement fra.traineddata depuis GitHub/tesseract-ocr/tessdata
+        echo et placez-le dans : %TESSDATA%
+        pause
+        exit /b 1
+    )
+    echo fra.traineddata installe avec succes.
+)
+
+:: Definir les variables pour Tesseract
+set "TESSDATA_PREFIX=%TESSDATA%"
+set "PATH=%TESS_DIR%;%PATH%"
+
 echo Lancement...
 cd /d "%ROOT%"
 "%PY%" main.py

@@ -7,6 +7,9 @@ from __future__ import annotations
 
 from typing import Dict, List, Tuple
 
+import os
+import shutil
+
 import fitz  # PyMuPDF
 from PIL import Image
 
@@ -16,6 +19,25 @@ RENDER_DPI = 300
 TESSERACT_LANG = "fra"
 TESSERACT_CONFIG = "--oem 3 --psm 3"
 MIN_CONFIDENCE = 30.0
+
+# Auto-configure Tesseract on Windows if not already set
+def _setup_tesseract() -> None:
+    import pytesseract  # type: ignore
+
+    # If already on PATH, nothing to do
+    if shutil.which("tesseract"):
+        return
+
+    for candidate in [
+        r"C:\Program Files\Tesseract-OCR\tesseract.exe",
+        r"C:\Program Files (x86)\Tesseract-OCR\tesseract.exe",
+    ]:
+        if os.path.isfile(candidate):
+            pytesseract.pytesseract.tesseract_cmd = candidate
+            tessdata = os.path.join(os.path.dirname(candidate), "tessdata")
+            if not os.environ.get("TESSDATA_PREFIX"):
+                os.environ["TESSDATA_PREFIX"] = tessdata
+            break
 
 
 def detect_ocr_engine() -> str:
@@ -46,6 +68,7 @@ def run_ocr_tesseract(image: Image.Image, page_num: int,
     """Run Tesseract OCR on a PIL image and return word-level OcrWord list."""
     import pytesseract  # type: ignore
     from pytesseract import Output  # type: ignore
+    _setup_tesseract()
 
     data = pytesseract.image_to_data(
         image,

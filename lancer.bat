@@ -71,10 +71,14 @@ if errorlevel 1 (
 :: ─── Lancer l'application ────────────────────────────────────────────────────
 echo Lancement de l'Anonymiseur PDF...
 cd /d "%ROOT%"
-"%PY%" main.py
+"%PY%" main.py 2>"%ROOT%erreur.log"
 if errorlevel 1 (
     echo.
-    echo [ERREUR] L'application s'est terminee avec une erreur.
+    echo [ERREUR] L'application s'est terminee avec une erreur :
+    echo --------------------------------------------------------
+    type "%ROOT%erreur.log"
+    echo --------------------------------------------------------
+    echo Le detail est sauvegarde dans erreur.log
     pause
 )
 endlocal

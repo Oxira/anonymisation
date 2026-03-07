@@ -335,17 +335,26 @@ def rule_based_name_detect(
 
         while j < n:
             w = ocr_words[j]
-            wclean = w.text.translate(_STRIP)
+            wclean = w.text.translate(_STRIP).strip()
 
-            if _COMPOUND_NOM_RE.match(wclean) and len(wclean) >= 2:
+            # Require at least 4 chars to avoid false positives on "RE", "GO", etc.
+            if _COMPOUND_NOM_RE.match(wclean) and len(wclean) >= 4:
                 nom_group.append((j, w))
                 j += 1
-            elif _PARTICLE_RE.match(wclean) and j + 1 < n:
-                # Include particle only when the next token is ALL-CAPS
-                next_clean = ocr_words[j + 1].text.translate(_STRIP)
-                if _COMPOUND_NOM_RE.match(next_clean):
+            elif _PARTICLE_RE.match(wclean):
+                if nom_group:
+                    # Particle after a confirmed NOM — always include (handles
+                    # "PONCELIN DE" even when what follows is an email or comma)
                     nom_group.append((j, w))
                     j += 1
+                elif j + 1 < n:
+                    # Particle at the start: only include if followed by ALL-CAPS
+                    next_clean = ocr_words[j + 1].text.translate(_STRIP).strip()
+                    if _COMPOUND_NOM_RE.match(next_clean) and len(next_clean) >= 4:
+                        nom_group.append((j, w))
+                        j += 1
+                    else:
+                        break
                 else:
                     break
             else:
@@ -360,6 +369,60 @@ def rule_based_name_detect(
                 char_start=cs,
                 char_end=ce,
             ))
+
+    return matches
+
+
+def word_level_phone_detect(
+    ocr_words: List[OcrWord],
+    char_to_word: Dict[int, int],
+) -> List[PiiMatch]:
+    """
+    Detect phone numbers split across OCR tokens.
+
+    Joins up to 6 consecutive same-block tokens and scans for the phone pattern.
+    Handles e.g. '06' + '12' + '34' + '56' + '78' as separate tokens.
+    """
+    PHONE_RE = re.compile(
+        r"(?:(?:\+|00)33[\s.\-]?|0)[1-9](?:[\s.\-]?\d{2}){4}"
+    )
+    wcr = _word_char_range(char_to_word)
+    matches: List[PiiMatch] = []
+    n = len(ocr_words)
+    seen_word_sets: List[frozenset] = []
+
+    for i in range(n):
+        for end in range(i + 1, min(i + 7, n + 1)):
+            group = ocr_words[i:end]
+            # Only join tokens from the same block
+            if len({w.block_num for w in group}) > 1:
+                break
+
+            joined = " ".join(w.text for w in group)
+            m = PHONE_RE.search(joined)
+            if not m:
+                continue
+
+            word_idx_set = frozenset(range(i, end))
+            if any(word_idx_set <= s for s in seen_word_sets):
+                continue
+            seen_word_sets.append(word_idx_set)
+
+            ranges = [wcr[wi] for wi in range(i, end) if wi in wcr]
+            if ranges:
+                cs = min(r[0] for r in ranges)
+                ce = max(r[1] for r in ranges)
+            else:
+                cs, ce = 0, 0
+
+            matches.append(PiiMatch(
+                pii_type=PiiType.TELEPHONE,
+                words=list(group),
+                raw_text=m.group(0),
+                char_start=cs,
+                char_end=ce,
+            ))
+            break
 
     return matches
 
@@ -436,6 +499,7 @@ def detect_pii(
     ner_matches = ner_detect(full_text, ocr_words, char_to_word, nlp, prenom_spans)
     rule_matches = rule_based_name_detect(ocr_words, char_to_word)
     email_matches = word_level_email_detect(ocr_words, char_to_word)
+    phone_matches = word_level_phone_detect(ocr_words, char_to_word)
 
-    all_matches = regex_matches + ner_matches + rule_matches + email_matches
+    all_matches = regex_matches + ner_matches + rule_matches + email_matches + phone_matches
     return _remove_overlapping(all_matches)

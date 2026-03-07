@@ -82,7 +82,12 @@ def run_ocr_tesseract(image: Image.Image, page_num: int,
     for i in range(n):
         text = data["text"][i].strip()
         conf = float(data["conf"][i])
-        if not text or conf < min_confidence:
+        if not text or conf < 0:
+            continue
+        # Always keep tokens that look like emails or phone numbers regardless
+        # of Tesseract confidence (OCR often gives low scores to special chars)
+        is_pii_like = "@" in text or (text.replace(" ", "").replace(".", "").replace("+", "").isdigit() and len(text) >= 8)
+        if conf < min_confidence and not is_pii_like:
             continue
         words.append(OcrWord(
             text=text,

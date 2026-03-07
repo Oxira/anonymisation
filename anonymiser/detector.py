@@ -65,6 +65,15 @@ _COMPOUND_NOM_RE = re.compile(
     r"(?:-[A-ZÀÂÆÇÉÈÊËÎÏÔŒÙÛÜŸ][A-ZÀÂÆÇÉÈÊËÎÏÔŒÙÛÜŸ]+)*$"
 )
 
+# A typical French first name: starts with uppercase, rest lowercase, optionally hyphenated
+_FIRSTNAME_RE = re.compile(
+    r"^[A-ZÀÂÆÇÉÈÊËÎÏÔŒÙÛÜŸ][a-zàâæçéèêëîïôœùûüÿ]{1,}"
+    r"(?:-[A-ZÀÂÆÇÉÈÊËÎÏÔŒÙÛÜŸ][a-zàâæçéèêëîïôœùûüÿ]+)*$"
+)
+
+# Particles that can appear inside a compound last name (DE, DU, DE LA …)
+_PARTICLE_RE = re.compile(r"^(DE|DU|DES|D|LE|LA|LES)$")
+
 
 def load_nlp_model():
     """Load the spaCy French model. Called once at startup."""
@@ -289,6 +298,128 @@ def _remove_overlapping(matches: List[PiiMatch]) -> List[PiiMatch]:
     return result
 
 
+def _word_char_range(char_to_word: Dict[int, int]) -> Dict[int, Tuple[int, int]]:
+    """Build a word_idx → (char_start, char_end) mapping from char_to_word."""
+    buckets: Dict[int, List[int]] = {}
+    for char_idx, word_idx in char_to_word.items():
+        buckets.setdefault(word_idx, []).append(char_idx)
+    return {idx: (min(chars), max(chars) + 1) for idx, chars in buckets.items()}
+
+
+def rule_based_name_detect(
+    ocr_words: List[OcrWord],
+    char_to_word: Dict[int, int],
+) -> List[PiiMatch]:
+    """
+    Fallback rule-based name detection.
+
+    Pattern: a mixed-case token (first name) followed by one or more ALL-CAPS
+    tokens (last names), optionally separated by particles (DE, DU …).
+
+    This catches cases where spaCy fails to recognise the PERSON entity
+    (common in email-header contexts with uncommon names).
+    """
+    wcr = _word_char_range(char_to_word)
+    matches: List[PiiMatch] = []
+    n = len(ocr_words)
+
+    _STRIP = str.maketrans("", "", ".,;:!?\"'<>()[]")
+
+    for i, word in enumerate(ocr_words):
+        clean = word.text.translate(_STRIP)
+        if not _FIRSTNAME_RE.match(clean):
+            continue
+
+        j = i + 1
+        nom_group: List[Tuple[int, OcrWord]] = []  # (word_idx_in_list, word)
+
+        while j < n:
+            w = ocr_words[j]
+            wclean = w.text.translate(_STRIP)
+
+            if _COMPOUND_NOM_RE.match(wclean) and len(wclean) >= 2:
+                nom_group.append((j, w))
+                j += 1
+            elif _PARTICLE_RE.match(wclean) and j + 1 < n:
+                # Include particle only when the next token is ALL-CAPS
+                next_clean = ocr_words[j + 1].text.translate(_STRIP)
+                if _COMPOUND_NOM_RE.match(next_clean):
+                    nom_group.append((j, w))
+                    j += 1
+                else:
+                    break
+            else:
+                break
+
+        for word_idx, nw in nom_group:
+            cs, ce = wcr.get(word_idx, (0, 0))
+            matches.append(PiiMatch(
+                pii_type=PiiType.NOM,
+                words=[nw],
+                raw_text=nw.text,
+                char_start=cs,
+                char_end=ce,
+            ))
+
+    return matches
+
+
+def word_level_email_detect(
+    ocr_words: List[OcrWord],
+    char_to_word: Dict[int, int],
+) -> List[PiiMatch]:
+    """
+    Detect email addresses that Tesseract split across multiple tokens.
+
+    Tries joining up to 3 consecutive same-line tokens and scanning for
+    the email regex (handles splits like ``<alain.bare`` + ``@ima.eu>``).
+    """
+    EMAIL_RE = re.compile(r"[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}")
+    wcr = _word_char_range(char_to_word)
+    matches: List[PiiMatch] = []
+    n = len(ocr_words)
+    seen_word_sets: List[frozenset] = []
+
+    for i in range(n):
+        for end in range(i + 1, min(i + 4, n + 1)):
+            group = ocr_words[i:end]
+            # Only join tokens on the same block+line
+            if len({(w.block_num, w.line_num) for w in group}) > 1:
+                break
+
+            joined = "".join(w.text for w in group)
+            if "@" not in joined:
+                continue
+
+            m = EMAIL_RE.search(joined)
+            if not m:
+                continue
+
+            word_idx_set = frozenset(range(i, end))
+            # Skip if already covered by a previous (larger) group
+            if any(word_idx_set <= s for s in seen_word_sets):
+                continue
+            seen_word_sets.append(word_idx_set)
+
+            ranges = [wcr[wi] for wi in range(i, end) if wi in wcr]
+            if ranges:
+                cs = min(r[0] for r in ranges)
+                ce = max(r[1] for r in ranges)
+            else:
+                cs, ce = 0, 0
+
+            matches.append(PiiMatch(
+                pii_type=PiiType.EMAIL,
+                words=list(group),
+                raw_text=m.group(0),
+                char_start=cs,
+                char_end=ce,
+            ))
+            break  # one email match per starting word is enough
+
+    return matches
+
+
 def detect_pii(
     ocr_words: List[OcrWord],
     full_text: str,
@@ -303,6 +434,8 @@ def detect_pii(
     """
     regex_matches, prenom_spans = regex_detect(full_text)
     ner_matches = ner_detect(full_text, ocr_words, char_to_word, nlp, prenom_spans)
+    rule_matches = rule_based_name_detect(ocr_words, char_to_word)
+    email_matches = word_level_email_detect(ocr_words, char_to_word)
 
-    all_matches = regex_matches + ner_matches
+    all_matches = regex_matches + ner_matches + rule_matches + email_matches
     return _remove_overlapping(all_matches)

@@ -14,6 +14,8 @@ Detection strategy for names:
 from __future__ import annotations
 
 import re
+import unicodedata
+from dataclasses import replace as _dc_replace
 from typing import Dict, List, Set, Tuple
 
 from .models import OcrWord, PiiMatch, PiiType
@@ -65,14 +67,52 @@ _COMPOUND_NOM_RE = re.compile(
     r"(?:-[A-ZÀÂÆÇÉÈÊËÎÏÔŒÙÛÜŸ][A-ZÀÂÆÇÉÈÊËÎÏÔŒÙÛÜŸ]+)*$"
 )
 
-# A typical French first name: starts with uppercase, rest lowercase, optionally hyphenated
-_FIRSTNAME_RE = re.compile(
-    r"^[A-ZÀÂÆÇÉÈÊËÎÏÔŒÙÛÜŸ][a-zàâæçéèêëîïôœùûüÿ]{1,}"
-    r"(?:-[A-ZÀÂÆÇÉÈÊËÎÏÔŒÙÛÜŸ][a-zàâæçéèêëîïôœùûüÿ]+)*$"
-)
-
 # Particles that can appear inside a compound last name (DE, DU, DE LA …)
-_PARTICLE_RE = re.compile(r"^(DE|DU|DES|D|LE|LA|LES)$")
+# Case-insensitive: Tesseract may render "DE" as "De" or "de"
+_PARTICLE_RE = re.compile(r"^(DE|DU|DES|D|LE|LA|LES)$", re.IGNORECASE)
+
+
+def _is_firstname_token(text: str) -> bool:
+    """
+    Return True if *text* looks like a first name.
+
+    Rules (encoding-agnostic — handles OCR Unicode variations):
+    - At least 2 characters
+    - First character is uppercase
+    - Contains at least one lowercase letter  → not an acronym / all-caps NOM
+    - Is NOT matched by _COMPOUND_NOM_RE       → pure all-caps last name
+    """
+    if len(text) < 2:
+        return False
+    if not text[0].isupper():
+        return False
+    if _COMPOUND_NOM_RE.match(text):
+        return False  # pure all-caps → it's a NOM
+    return any(c.islower() for c in text)
+
+
+def _nom_subword(ocr_word: OcrWord, nom_text: str) -> OcrWord:
+    """
+    When *ocr_word* is a merged token (e.g. OCR produced "Coralline TEXIER"
+    as one word), return a pseudo-OcrWord whose bounding box covers only the
+    *nom_text* portion (estimated by proportional character widths).
+
+    Falls back to the full *ocr_word* if *nom_text* is not found.
+    """
+    word_text = unicodedata.normalize("NFC", ocr_word.text)
+    nom_nfc = unicodedata.normalize("NFC", nom_text)
+
+    idx = word_text.find(nom_nfc)
+    if idx < 0 or word_text == nom_nfc:
+        return ocr_word  # not a merged token, or exact match
+
+    total_chars = len(word_text)
+    char_w = ocr_word.img_w / total_chars if total_chars > 0 else 0
+
+    new_x = ocr_word.img_x + int(idx * char_w)
+    new_w = max(1, int(len(nom_nfc) * char_w))
+
+    return _dc_replace(ocr_word, img_x=new_x, img_w=new_w)
 
 
 def load_nlp_model():
@@ -247,7 +287,10 @@ def ner_detect(
                             word_indices.add(char_to_word[char_idx])
                     if word_indices:
                         token_words = [ocr_words[i] for i in sorted(word_indices)]
-                        nom_words.extend(token_words)
+                        # If an OCR word is a merged firstname+lastname token,
+                        # split the bounding box so only the NOM part is redacted
+                        split_words = [_nom_subword(w, token.text) for w in token_words]
+                        nom_words.extend(split_words)
                         nom_text_parts.append(token.text)
 
             if nom_words:
@@ -326,8 +369,8 @@ def rule_based_name_detect(
     _STRIP = str.maketrans("", "", ".,;:!?\"'<>()[]")
 
     for i, word in enumerate(ocr_words):
-        clean = word.text.translate(_STRIP)
-        if not _FIRSTNAME_RE.match(clean):
+        clean = unicodedata.normalize("NFC", word.text.translate(_STRIP).strip())
+        if not _is_firstname_token(clean):
             continue
 
         j = i + 1
@@ -335,7 +378,7 @@ def rule_based_name_detect(
 
         while j < n:
             w = ocr_words[j]
-            wclean = w.text.translate(_STRIP).strip()
+            wclean = unicodedata.normalize("NFC", w.text.translate(_STRIP).strip())
 
             # Require at least 4 chars to avoid false positives on "RE", "GO", etc.
             if _COMPOUND_NOM_RE.match(wclean) and len(wclean) >= 4:
@@ -394,8 +437,10 @@ def word_level_phone_detect(
     for i in range(n):
         for end in range(i + 1, min(i + 7, n + 1)):
             group = ocr_words[i:end]
-            # Only join tokens from the same block
-            if len({w.block_num for w in group}) > 1:
+            first, last = group[0], group[-1]
+            # Allow cross-block joining only when words are on the same visual
+            # line (vertical distance < 2× the line height of the first word)
+            if abs(last.img_y - first.img_y) > first.img_h * 2:
                 break
 
             joined = " ".join(w.text for w in group)
